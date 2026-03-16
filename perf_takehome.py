@@ -101,11 +101,13 @@ class KernelBuilder:
             for k in range(V):
                 ops.append(("alu", ("^", vv + k, vv + k, root_node_vec + k)))
         elif depth == 1:
-            ops.append(("valu", ("-", an, iv, fp_vec)))
+            for k in range(V):
+                ops.append(("alu", ("-", an + k, iv + k, fp_vec + k)))
             for k in range(V):
                 ops.append(("alu", ("&", h1 + k, an + k, ones_vec + k)))
-            ops.append(("valu", ("multiply_add", an, d1_diff_vec, h1, node2_vec)))
-            ops.append(("valu", ("^", vv, vv, an)))
+            ops.append(("flow", ("vselect", an, h1, node1_vec, node2_vec)))
+            for k in range(V):
+                ops.append(("alu", ("^", vv + k, vv + k, an + k)))
         elif depth == 2:
             ops.append(("valu", ("-", an, iv, fp3_vec)))
             for k in range(V):
@@ -137,9 +139,9 @@ class KernelBuilder:
                 ops.append(("alu", ("&", t4 + k, an + k, fours_vec + k)))
             # h1=bit0, h2=bit1, t4=bit2, an=free, t3=free
 
-            # All 4 pairs via multiply_add (h1=bit0 preserved through reads)
-            ops.append(("valu", ("multiply_add", an, d3_diff_78, h1, node7_vec)))
-            ops.append(("valu", ("multiply_add", t3, d3_diff_910, h1, node9_vec)))
+            # First 2 pairs via vselect to save VALU
+            ops.append(("flow", ("vselect", an, h1, node8_vec, node7_vec)))
+            ops.append(("flow", ("vselect", t3, h1, node10_vec, node9_vec)))
             ops.append(("flow", ("vselect", an, h2, t3, an)))
             # an=left, h1=bit0 preserved, h2=bit1 preserved, t4=bit2
 
