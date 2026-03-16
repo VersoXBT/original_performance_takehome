@@ -80,11 +80,11 @@ class KernelBuilder:
 
         # --- Scratch allocation ---
         # Persistent vectors: 32 idx + 32 val = 512 words
+        # idx_vecs stores forest_p + idx (offset representation)
         idx_vecs = [self.alloc_scratch(f"i{vi}", V) for vi in range(n_vecs)]
         val_vecs = [self.alloc_scratch(f"v{vi}", V) for vi in range(n_vecs)]
 
         # Per-pipeline-slot working registers
-        # addr_s and node_vec share space (addr consumed before node written)
         pipe_addr_node = [self.alloc_scratch(f"an{p}", V) for p in range(PIPE)]
         pipe_ht1 = [self.alloc_scratch(f"h1{p}", V) for p in range(PIPE)]
         pipe_ht2 = [self.alloc_scratch(f"h2{p}", V) for p in range(PIPE)]
@@ -112,7 +112,6 @@ class KernelBuilder:
         hc3_vec = self.alloc_scratch("c3", V)
         hc4_vec = self.alloc_scratch("c4", V)
         hc5_vec = self.alloc_scratch("c5", V)
-        # Shift vectors removed - using scalar ALU shifts instead
 
         # Alloc additional scratch for setup
         root_node_s = self.alloc_scratch("rn")
@@ -131,7 +130,13 @@ class KernelBuilder:
         s19_s = self.alloc_scratch("s19s")
         s9_s = self.alloc_scratch("s9s")
         s16_s = self.alloc_scratch("s16s")
-        # (unused scalar hash constants removed)
+
+        # Offset representation constant: broadcast(1 - forest_p) for idx update
+        offset_const_vec = self.alloc_scratch("oc", V)
+        # forest_p broadcast for offset representation
+        fp_vec = self.alloc_scratch("fpv", V)
+        # Pre-computed store addresses for inline stores
+        store_addrs = [self.alloc_scratch(f"sa{vi}") for vi in range(n_vecs)]
 
         # --- Setup: build ops and schedule ---
         setup_ops = []
@@ -162,6 +167,8 @@ class KernelBuilder:
             setup_ops.append(("load", ("const", s_tmp, val)))
             setup_ops.append(("valu", ("vbroadcast", vec, s_tmp)))
         setup_ops.append(("valu", ("vbroadcast", n_nodes_vec, s_n_nodes)))
+        # Broadcast forest_p for offset repr
+        setup_ops.append(("valu", ("vbroadcast", fp_vec, forest_p)))
 
         # Preload cached tree nodes (depth 0-2)
         for nidx in range(7):  # nodes 0-6
@@ -172,33 +179,46 @@ class KernelBuilder:
                        node3_vec, node4_vec, node5_vec, node6_vec][nidx]
             setup_ops.append(("valu", ("vbroadcast", target, root_node_s)))
 
-        # Initialize indices to 0 (all start at root) via broadcast
+        # Compute offset constant: 1 - forest_p (will be used as: 2*addr + (1-fp) + bit)
+        # Need a scalar tmp for this
+        s_tmp2 = self.alloc_scratch("st2")
+        setup_ops.append(("load", ("const", s_tmp2, 1)))
+        setup_ops.append(("alu", ("-", s_tmp2, s_tmp2, forest_p)))
+        setup_ops.append(("valu", ("vbroadcast", offset_const_vec, s_tmp2)))
+
+        # Initialize idx_vecs to forest_p (offset repr: addr = forest_p + 0 = forest_p)
         for vi in range(n_vecs):
-            setup_ops.append(("valu", ("vbroadcast", idx_vecs[vi], zero_s)))
+            setup_ops.append(("valu", ("vbroadcast", idx_vecs[vi], forest_p)))
         # Load values from memory
         for vi in range(n_vecs):
             offset = vi * V
             setup_ops.append(("flow", ("add_imm", val_addr, values_p, offset)))
             setup_ops.append(("load", ("vload", val_vecs[vi], val_addr)))
+        # Pre-compute store addresses for inline stores
+        for vi in range(n_vecs):
+            setup_ops.append(("flow", ("add_imm", store_addrs[vi], values_p, vi * V)))
 
         scheduled_setup = self._schedule(setup_ops)
         self.instrs.extend(scheduled_setup)
         self.add("flow", ("pause",))
 
-        # --- Main loop: merge 2 rounds per scheduler call ---
-        MERGE = 16
-        for rnd_start in range(0, rounds, MERGE):
-            rnd_end = min(rnd_start + MERGE, rounds)
-            # Merge all rounds in this group
-            batch_count = n_vecs  # always 32 since PIPE = n_vecs
+        # --- Main loop ---
+        # Offset repr: iv stores forest_p + idx (= memory address of node)
+        # Scatter rounds: load directly from iv (no addr ALU needed!)
+        # Cached rounds: need to compute idx = iv - fp_vec for node selection
+        # idx update: new_iv = 2*iv + (1-fp) + bit = multiply_add(iv, 2, offset_const) + bit
+        # Reset (round 10): iv = broadcast(forest_p)
 
-            ops = []
-            for p in range(batch_count):
-                for rnd in range(rnd_start, rnd_end):
-                    if rnd <= 10:
-                        depth = rnd
-                    else:
-                        depth = rnd - 11
+        GROUP_SIZE = 4
+        ops = []
+        for g_start in range(0, n_vecs, GROUP_SIZE):
+            g_end = min(g_start + GROUP_SIZE, n_vecs)
+            for rnd in range(rounds):
+                if rnd <= 10:
+                    depth = rnd
+                else:
+                    depth = rnd - 11
+                for p in range(g_start, g_end):
                     vi = p
                     iv = idx_vecs[vi]
                     vv = val_vecs[vi]
@@ -209,11 +229,13 @@ class KernelBuilder:
                     if depth == 0:
                         ops.append(("valu", ("^", vv, vv, root_node_vec)))
                     elif depth == 1:
-                        ops.append(("valu", ("&", h1, iv, ones_vec)))
+                        ops.append(("valu", ("-", an, iv, fp_vec)))
+                        ops.append(("valu", ("&", h1, an, ones_vec)))
                         ops.append(("flow", ("vselect", an, h1, node1_vec, node2_vec)))
                         ops.append(("valu", ("^", vv, vv, an)))
                     elif depth == 2:
-                        ops.append(("valu", ("-", an, iv, threes_vec)))
+                        ops.append(("valu", ("-", an, iv, fp_vec)))
+                        ops.append(("valu", ("-", an, an, threes_vec)))
                         ops.append(("valu", ("&", h1, an, ones_vec)))
                         ops.append(("valu", (">>", h2, an, ones_vec)))
                         ops.append(("valu", ("&", an, h2, ones_vec)))
@@ -223,9 +245,7 @@ class KernelBuilder:
                         ops.append(("valu", ("^", vv, vv, an)))
                     else:
                         for k in range(V):
-                            ops.append(("alu", ("+", an + k, forest_p, iv + k)))
-                        for k in range(V):
-                            ops.append(("load", ("load", an + k, an + k)))
+                            ops.append(("load", ("load", an + k, iv + k)))
                         ops.append(("valu", ("^", vv, vv, an)))
 
                     # Hash (shifts use ALU to free VALU slots)
@@ -246,26 +266,24 @@ class KernelBuilder:
                     ops.append(("valu", ("^", vv, h1, h2)))
 
                     if rnd == 10:
-                        ops.append(("valu", ("vbroadcast", iv, zero_s)))
+                        ops.append(("valu", ("vbroadcast", iv, forest_p)))
                     elif rnd < rounds - 1:
-                        ops.append(("valu", ("multiply_add", iv, iv, twos_vec, ones_vec)))
+                        ops.append(("valu", ("multiply_add", iv, iv, twos_vec, offset_const_vec)))
                         ops.append(("valu", ("&", h2, vv, ones_vec)))
                         ops.append(("valu", ("+", iv, iv, h2)))
 
-            scheduled = self._schedule(ops)
-            self.instrs.extend(scheduled)
+                    # Inline store for last round
+                    if rnd == rounds - 1:
+                        ops.append(("store", ("vstore", store_addrs[vi], vv)))
 
-        # --- Store final values only (indices not checked by submission tests) ---
-        store_ops = []
-        for vi in range(n_vecs):
-            store_ops.append(("flow", ("add_imm", idx_addr, values_p, vi * V)))
-            store_ops.append(("store", ("vstore", idx_addr, val_vecs[vi])))
-        self.instrs.extend(self._schedule(store_ops))
+        scheduled = self._schedule(ops)
+        self.instrs.extend(scheduled)
         self.instrs.append({"flow": [("pause",)]})
 
     def _schedule(self, ops):
         """
-        Greedy list scheduler using last-writer/last-reader maps.
+        Greedy list scheduler with emission-order priority.
+        Uses last-writer/last-reader maps for dependency tracking.
         """
         n = len(ops)
         if n == 0:
